@@ -6,7 +6,7 @@ FAAD     ?= $(shell brew --prefix faad2 2>/dev/null || echo /usr/local)
 BUILD    := build
 BEARSSL  := vendor/BearSSL
 BRLIB    := $(BUILD)/bearssl/libbearssl.a
-SRCS     := src/main.c src/net.c src/yt.c src/audio.c src/decode.c src/resample.c
+SRCS     := src/main.c src/net.c src/yt.c src/audio.c src/decode.c src/resample.c src/sbuf.c
 OBJS     := $(SRCS:src/%.c=$(BUILD)/%.o)
 
 CPPFLAGS += -I$(BEARSSL)/inc -I$(FAAD)/include

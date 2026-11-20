@@ -2,26 +2,30 @@
 #include "decode.h"
 
 #include <neaacdec.h>
-#include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 
-#define INBUF 16384 /* > max ADTS frame (8191 bytes) */
+#define INBUF 16384 /* > 2 x max ADTS frame (8191 bytes) */
 
 static NeAACDecHandle h;
 static int inited;
 static unsigned char in[INBUF];
-static size_t off, len;   /* valid bytes are in[off .. off+len) */
-static size_t skip;       /* bytes of an ID3 tag still to discard */
-static unsigned long errors;
-static unsigned long long bytes_total, frames_total;
-static int last_rate;
+static size_t off, len; /* valid bytes are in[off .. off+len) */
+static size_t skip;     /* bytes of an ID3 tag still to discard */
 static float stereo[2048 * 2];
+static _Atomic unsigned long errors;
+static _Atomic unsigned long long bytes_total, frames_total;
+static _Atomic int last_rate;
+static _Atomic size_t buffered;
 
-unsigned long dec_errors(void) { return errors; }
+unsigned long dec_errors(void) { return atomic_load(&errors); }
+size_t dec_buffered(void) { return atomic_load(&buffered); }
 
 double dec_bytes_per_sec(void) {
-    if (!frames_total || !last_rate) return 0;
-    return (double)bytes_total * last_rate / (double)frames_total;
+    unsigned long long f = atomic_load(&frames_total);
+    int r = atomic_load(&last_rate);
+    if (!f || !r) return 0;
+    return (double)atomic_load(&bytes_total) * r / (double)f;
 }
 
 int dec_open(void) {
@@ -36,6 +40,7 @@ int dec_open(void) {
 
 void dec_reset(void) {
     off = len = skip = 0;
+    atomic_store(&buffered, 0);
     if (inited) NeAACDecPostSeekReset(h, 0);
 }
 
@@ -45,12 +50,13 @@ static void consume(size_t n) {
     if (len == 0) off = 0;
 }
 
-static int decode_frame(const unsigned char *f, size_t flen, pcm_sink sink, void *ctx) {
+/* Returns frames decoded, 0 if the frame was unusable. */
+static int decode_frame(const unsigned char *f, size_t flen) {
     if (!inited) {
         unsigned long rate;
         unsigned char ch;
         if (NeAACDecInit(h, (unsigned char *)f, (unsigned long)flen, &rate, &ch) < 0) {
-            errors++;
+            atomic_fetch_add(&errors, 1);
             return 0;
         }
         inited = 1;
@@ -58,7 +64,7 @@ static int decode_frame(const unsigned char *f, size_t flen, pcm_sink sink, void
     NeAACDecFrameInfo fi;
     float *pcm = NeAACDecDecode(h, &fi, (unsigned char *)f, (unsigned long)flen);
     if (fi.error || !pcm || fi.channels == 0) {
-        if (fi.error) errors++;
+        if (fi.error) atomic_fetch_add(&errors, 1);
         return 0;
     }
     int frames = (int)(fi.samples / fi.channels);
@@ -73,37 +79,20 @@ static int decode_frame(const unsigned char *f, size_t flen, pcm_sink sink, void
             stereo[2 * i + 1] = r;
         }
     }
-    bytes_total += flen;
-    frames_total += (unsigned long long)frames;
-    last_rate = (int)fi.samplerate;
-    return sink(stereo, frames, (int)fi.samplerate, ctx);
+    atomic_fetch_add(&bytes_total, flen);
+    atomic_fetch_add(&frames_total, (unsigned long long)frames);
+    atomic_store(&last_rate, (int)fi.samplerate);
+    return frames;
 }
 
-int dec_feed(const void *data, size_t n, pcm_sink sink, void *ctx) {
-    const unsigned char *p = data;
-    while (n > 0) {
-        if (skip) {
-            size_t k = n < skip ? n : skip;
-            p += k, n -= k, skip -= k;
-            continue;
+int dec_next(dec_pull pull, const float **pcm, int *rate) {
+    for (;;) {
+        if (skip && len) {
+            size_t s = len < skip ? len : skip;
+            consume(s);
+            skip -= s;
         }
-        if (off + len == INBUF) { /* compact */
-            memmove(in, in + off, len);
-            off = 0;
-        }
-        size_t room = INBUF - (off + len);
-        size_t k = n < room ? n : room;
-        memcpy(in + off + len, p, k);
-        len += k, p += k, n -= k;
-
-        for (;;) {
-            if (skip) {
-                size_t s = len < skip ? len : skip;
-                consume(s);
-                skip -= s;
-                if (skip) break;
-            }
-            if (len < 10) break;
+        if (!skip && len >= 10) {
             const unsigned char *b = in + off;
             if (b[0] == 'I' && b[1] == 'D' && b[2] == '3') {
                 size_t tag = ((size_t)(b[6] & 0x7f) << 21) | ((size_t)(b[7] & 0x7f) << 14) |
@@ -117,14 +106,37 @@ int dec_feed(const void *data, size_t n, pcm_sink sink, void *ctx) {
                     consume(1);
                     continue;
                 }
-                if (len < flen) break;
-                int stop = decode_frame(b, flen, sink, ctx);
-                consume(flen);
-                if (stop) return stop;
+                if (len >= flen) {
+                    int frames = decode_frame(b, flen);
+                    consume(flen);
+                    atomic_store(&buffered, len);
+                    if (frames > 0) {
+                        *pcm = stereo;
+                        *rate = atomic_load(&last_rate);
+                        return frames;
+                    }
+                    continue;
+                }
+            } else {
+                consume(1); /* resync */
                 continue;
             }
-            consume(1); /* resync */
         }
+        /* need more input */
+        if (off > 0 && off + len > INBUF / 2) {
+            memmove(in, in + off, len);
+            off = 0;
+        }
+        size_t room = INBUF - (off + len);
+        if (room == 0) { /* garbage that never syncs: start over */
+            off = len = 0;
+            room = INBUF;
+        }
+        size_t n = pull(in + off + len, room);
+        if (n == 0) {
+            atomic_store(&buffered, len);
+            return 0;
+        }
+        len += n;
     }
-    return 0;
 }

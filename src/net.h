@@ -13,7 +13,7 @@
 typedef struct {
     int status;           /* HTTP status code, 0 if no response */
     long long head_seq;   /* X-Head-Seqnum, -1 if absent */
-    char location[2048];  /* Location header, "" if absent */
+    char location[4096];  /* Location header, "" if absent */
 } http_resp;
 
 /* Split "https://host/path" into host and path (path keeps the leading '/').

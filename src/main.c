@@ -1,9 +1,11 @@
 /* claude-radio: listen to Claude FM from the terminal with as little memory as possible.
  *
- *   net thread     HTTPS (BearSSL) -> segment by segment -> compressed ring (128 KB)
- *   decode thread  compressed ring -> faad2 (float) -> [resampler] -> PCM ring (64 KB)
- *   HAL IOProc     PCM ring -> output device
- *   main thread    keyboard + one status line
+ *   net thread   HTTPS (BearSSL) -> segment by segment -> lock-free stream buffer (128 KB)
+ *   HAL IOProc   stream buffer -> faad2 (float) -> [resampler] -> output device
+ *   main thread  keyboard + one status line
+ *
+ * Decoding runs inside CoreAudio's real-time callback, so playback never
+ * depends on an ordinary thread being scheduled in time.
  */
 #include <errno.h>
 #include <getopt.h>
@@ -23,11 +25,10 @@
 #include "audio.h"
 #include "decode.h"
 #include "net.h"
-#include "resample.h"
+#include "sbuf.h"
 #include "yt.h"
 
 #define VERSION       "0.1.0"
-#define CRING_SIZE    (128 * 1024) /* ~8 s of 128 kbps AAC */
 #define START_BEHIND  2            /* start this many segments behind the live edge */
 #define MAX_BEHIND    30           /* jump back to the edge if we fall further behind */
 #define SEGMENT_UA    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15\r\n"
@@ -40,81 +41,10 @@ static struct {
     int no_ui;
 } opt = {NULL, 234, 100, 0};
 
-/* ---- compressed ring (net -> decode) -------------------------------------- */
-static unsigned char cring[CRING_SIZE];
-static size_t c_head, c_len;
-static unsigned c_gen;
-static pthread_mutex_t c_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t c_cv = PTHREAD_COND_INITIALIZER;
-
-static int cring_write(const unsigned char *p, size_t n, unsigned gen) {
-    pthread_mutex_lock(&c_mu);
-    while (n > 0) {
-        while (c_len == CRING_SIZE && c_gen == gen) pthread_cond_wait(&c_cv, &c_mu);
-        if (c_gen != gen) {
-            pthread_mutex_unlock(&c_mu);
-            return -1;
-        }
-        size_t tail = (c_head + c_len) % CRING_SIZE;
-        size_t k = CRING_SIZE - c_len;
-        if (k > CRING_SIZE - tail) k = CRING_SIZE - tail;
-        if (k > n) k = n;
-        memcpy(cring + tail, p, k);
-        c_len += k, p += k, n -= k;
-        pthread_cond_broadcast(&c_cv);
-    }
-    pthread_mutex_unlock(&c_mu);
-    return 0;
-}
-
-/* Blocks until data arrives or the ring is flushed (then returns 0 and updates *gen). */
-static size_t cring_read(unsigned char *p, size_t max, unsigned *gen) {
-    pthread_mutex_lock(&c_mu);
-    while (c_len == 0 && c_gen == *gen) pthread_cond_wait(&c_cv, &c_mu);
-    if (c_gen != *gen) {
-        *gen = c_gen;
-        pthread_mutex_unlock(&c_mu);
-        return 0;
-    }
-    size_t k = c_len;
-    if (k > CRING_SIZE - c_head) k = CRING_SIZE - c_head;
-    if (k > max) k = max;
-    memcpy(p, cring + c_head, k);
-    c_head = (c_head + k) % CRING_SIZE;
-    c_len -= k;
-    pthread_cond_broadcast(&c_cv);
-    pthread_mutex_unlock(&c_mu);
-    return k;
-}
-
-static void cring_flush(void) {
-    pthread_mutex_lock(&c_mu);
-    c_head = c_len = 0;
-    c_gen++;
-    pthread_cond_broadcast(&c_cv);
-    pthread_mutex_unlock(&c_mu);
-}
-
-static unsigned cring_gen(void) {
-    pthread_mutex_lock(&c_mu);
-    unsigned g = c_gen;
-    pthread_mutex_unlock(&c_mu);
-    return g;
-}
-
-static size_t cring_fill(void) {
-    pthread_mutex_lock(&c_mu);
-    size_t n = c_len;
-    pthread_mutex_unlock(&c_mu);
-    return n;
-}
-
 /* ---- shared status --------------------------------------------------------- */
 enum { ST_CONNECTING, ST_OK, ST_RETRYING };
 static _Atomic int net_state = ST_CONNECTING;
 static _Atomic int have_audio;
-static _Atomic int resync_req;
-static _Atomic int out_rate;
 static _Atomic int paused;
 static pthread_mutex_t msg_mu = PTHREAD_MUTEX_INITIALIZER;
 static char net_msg[512];
@@ -142,6 +72,29 @@ static long backoff_ms(int fails) {
 
 /* ---- net thread ------------------------------------------------------------ */
 static stream_info si;
+static unsigned flush_seen;
+
+/* A flush was requested (resume after pause): everything written so far is stale. */
+static int check_flush(void) {
+    if (!audio_flush_pending(&flush_seen)) return 0;
+    audio_flush_ack(flush_seen, sbuf_wpos());
+    return 1;
+}
+
+/* Copy into the stream buffer, sleeping while it is full. -1 if a flush came in. */
+static int stream_write(const unsigned char *p, size_t n) {
+    while (n > 0) {
+        if (check_flush()) return -1;
+        size_t k = sbuf_write(p, n);
+        p += k, n -= k;
+        if (n) { /* full: sleep roughly until this chunk fits */
+            double bps = dec_bytes_per_sec();
+            long ms = bps > 0 ? (long)(n * 1000 / bps) + 20 : 200;
+            sleep_ms(ms < 50 ? 50 : ms > 1000 ? 1000 : ms);
+        }
+    }
+    return 0;
+}
 
 static void *net_main(void *arg) {
     (void)arg;
@@ -149,7 +102,7 @@ static void *net_main(void *arg) {
     char host[256], prev_id[32] = "";
     const char *path;
     long long sq = -1;
-    int need_resolve = 1, fails = 0, misses = 0;
+    int need_resolve = 1, fails = 0, misses = 0, resync = 0;
     time_t last_resolve = 0;
 
     for (;;) {
@@ -173,7 +126,9 @@ static void *net_main(void *arg) {
             need_resolve = 0;
             misses = 0;
         }
-        if (atomic_exchange(&resync_req, 0)) {
+        if (check_flush()) resync = 1;
+        if (resync) {
+            resync = 0;
             if (yt_refresh(&si) < 0) {
                 need_resolve = 1;
                 continue;
@@ -190,9 +145,17 @@ static void *net_main(void *arg) {
             continue;
         }
 
-        unsigned gen = cring_gen();
         http_resp r;
-        if (http_request("GET", host, path, SEGMENT_UA, NULL, 0, &r) < 0) {
+        int rc, hops = 0;
+        for (;;) { /* segment servers sometimes redirect to another edge host */
+            rc = http_request("GET", host, path, SEGMENT_UA, NULL, 0, &r);
+            if (rc < 0 || r.status / 100 != 3 || !r.location[0] || hops++ >= 3) break;
+            http_discard();
+            if (r.location[0] == '/') snprintf(url, sizeof url, "https://%s%s", host, r.location);
+            else snprintf(url, sizeof url, "%s", r.location);
+            if (url_split(url, host, sizeof host, &path) < 0) break;
+        }
+        if (rc < 0) {
             fails++;
             set_status(ST_RETRYING, "%s", net_last_error());
             if (fails >= 3) need_resolve = 1;
@@ -204,12 +167,13 @@ static void *net_main(void *arg) {
             ssize_t n;
             int aborted = 0;
             while ((n = http_read(buf, sizeof buf)) > 0)
-                if (cring_write(buf, (size_t)n, gen) < 0) {
+                if (stream_write(buf, (size_t)n) < 0) {
                     aborted = 1;
                     break;
                 }
-            if (aborted) { /* flushed (resume / resync) while downloading */
+            if (aborted) { /* flushed (resume) while downloading: rejoin the live edge */
                 http_close();
+                resync = 1;
                 continue;
             }
             sq++; /* even on a cut-off body: replaying half a segment sounds worse than a skip */
@@ -245,71 +209,6 @@ static void *net_main(void *arg) {
         set_status(ST_RETRYING, "segment server returned HTTP %d", r.status);
         if (fails >= 3) need_resolve = 1;
         else sleep_ms(backoff_ms(fails));
-    }
-    return NULL;
-}
-
-/* ---- decode thread --------------------------------------------------------- */
-static resampler rs;
-static float rs_out[(256 * 9 + 16) * 2];
-static int rs_in_rate, rs_out_rate;
-static unsigned dec_gen;
-
-/* Push frames into the PCM ring, waiting for room. -1 if the stream was flushed. */
-static int pcm_push(const float *p, size_t n) {
-    while (n > 0) {
-        if (cring_gen() != dec_gen) return -1;
-        size_t sp = pcm_space();
-        if (sp < n && sp < PCM_RING_FRAMES / 2) {
-            /* sleep until about half the ring is free: few wakeups per second */
-            int rate = atomic_load(&out_rate);
-            long ms = rate > 0 ? (long)((PCM_RING_FRAMES / 2 - sp) * 1000L / rate) : 20;
-            if (atomic_load(&paused) || ms < 5) ms = ms < 5 ? 5 : 200;
-            sleep_ms(ms);
-            continue;
-        }
-        size_t k = sp < n ? sp : n;
-        pcm_write(p, k);
-        p += k * 2;
-        n -= k;
-    }
-    return 0;
-}
-
-static int play_sink(const float *stereo, int frames, int rate, void *ctx) {
-    (void)ctx;
-    atomic_store(&have_audio, 1);
-    int orate = atomic_load(&out_rate);
-    if (rate != rs_in_rate || orate != rs_out_rate) {
-        if (rate != orate) rs_init(&rs, rate, orate);
-        rs_in_rate = rate;
-        rs_out_rate = orate;
-    }
-    if (rate == orate) return pcm_push(stereo, (size_t)frames) < 0;
-    for (int off = 0; off < frames; off += 256) {
-        int nin = frames - off < 256 ? frames - off : 256;
-        int n = rs_process(&rs, stereo + off * 2, nin, rs_out, (int)(sizeof rs_out / sizeof *rs_out / 2));
-        if (pcm_push(rs_out, (size_t)n) < 0) return 1;
-    }
-    return 0;
-}
-
-static void *decode_main(void *arg) {
-    (void)arg;
-    static unsigned char buf[4096];
-    dec_gen = cring_gen();
-    for (;;) {
-        unsigned g = dec_gen;
-        size_t n = cring_read(buf, sizeof buf, &g);
-        if (g != dec_gen) {
-            dec_gen = g;
-            dec_reset();
-            continue;
-        }
-        if (dec_feed(buf, n, play_sink, NULL)) {
-            dec_reset();
-            dec_gen = cring_gen();
-        }
     }
     return NULL;
 }
@@ -374,13 +273,13 @@ static const char *status_line(char *out, size_t sz, int muted, double listened)
     pthread_mutex_unlock(&msg_mu);
     int st = atomic_load(&net_state);
     double bps = dec_bytes_per_sec();
-    int rate = atomic_load(&out_rate);
-    double buffered = (bps > 0 ? cring_fill() / bps : 0) + (rate > 0 ? (double)pcm_fill() / rate : 0);
+    double buffered = bps > 0 ? (sbuf_fill() + dec_buffered()) / bps : 0;
+    if (audio_playing()) atomic_store(&have_audio, 1);
 
     if (atomic_load(&paused)) state = "paused";
     else if (st == ST_RETRYING) state = "reconnecting";
     else if (!atomic_load(&have_audio)) state = "connecting";
-    else if (buffered < 0.05) state = "buffering";
+    else if (!audio_playing()) state = "buffering";
     else state = "playing";
 
     long t = (long)listened;
@@ -423,22 +322,20 @@ static void draw(const char *line) {
 }
 
 /* ---- --decode (for testing the decoder) ------------------------------------ */
-static int file_sink(const float *stereo, int frames, int rate, void *ctx) {
-    (void)rate, (void)ctx;
-    fwrite(stereo, sizeof(float) * 2, (size_t)frames, stdout);
-    return 0;
-}
+static FILE *dec_in;
+static size_t file_pull(void *dst, size_t max) { return fread(dst, 1, max, dec_in); }
 
 static int decode_file(const char *path) {
-    FILE *f = strcmp(path, "-") ? fopen(path, "rb") : stdin;
+    FILE *f = dec_in = strcmp(path, "-") ? fopen(path, "rb") : stdin;
     if (!f) {
         perror(path);
         return 1;
     }
     if (dec_open() < 0) return 1;
-    unsigned char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) dec_feed(buf, n, file_sink, NULL);
+    const float *pcm;
+    int frames, rate;
+    while ((frames = dec_next(file_pull, &pcm, &rate)) > 0)
+        fwrite(pcm, sizeof(float) * 2, (size_t)frames, stdout);
     fprintf(stderr, "decode errors: %lu\n", dec_errors());
     return 0;
 }
@@ -532,11 +429,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "claude-radio: %s\n", audio_last_error());
         return 1;
     }
-    atomic_store(&out_rate, (int)audio_rate());
     int muted = 0;
     apply_volume(muted);
 
-    if (start_thread(net_main) || start_thread(decode_main)) {
+    if (start_thread(net_main)) {
         fprintf(stderr, "claude-radio: could not start threads\n");
         return 1;
     }
@@ -570,9 +466,7 @@ int main(int argc, char **argv) {
                 if (k == 'q' || k == 'Q' || k == 3) break;
                 if (k == ' ' || k == 'p') {
                     if (atomic_load(&paused)) {
-                        cring_flush();                 /* drop stale audio ... */
-                        atomic_store(&resync_req, 1);  /* ... and rejoin the live edge */
-                        pcm_drop();
+                        audio_flush_request(); /* drop stale audio, rejoin the live edge */
                         atomic_store(&paused, 0);
                         audio_start();
                     } else {
@@ -596,8 +490,6 @@ int main(int argc, char **argv) {
             audio_close();
             if (audio_open() == 0) {
                 device_retry = 0;
-                atomic_store(&out_rate, (int)audio_rate());
-                pcm_drop();
                 if (!atomic_load(&paused)) audio_start();
             } else {
                 device_retry = 1;
